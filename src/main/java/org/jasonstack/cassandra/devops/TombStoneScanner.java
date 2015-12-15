@@ -13,6 +13,20 @@
  */
 package org.jasonstack.cassandra.devops;
 
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -26,25 +40,16 @@ import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableReader;
 
-import java.io.IOException;
-import java.lang.reflect.Field;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-
 /**
  * Counts the number of tombstones in a column family folder
  */
-public class TomnStoneScanner {
+public class TombStoneScanner {
 
     private static final String partitionerName = "Murmur3Partitioner";
     private static List<TombstoneMetric> collector = new ArrayList<>();
 
     /**
-     * java -jar TomnStoneScanner.jar [FOLDER]
+     * java -jar TombStoneScanner.jar [FOLDER]
      * <p>
      * Counts the number of tombstones, per row, in a given SSTable
      * <p>
@@ -56,8 +61,8 @@ public class TomnStoneScanner {
      * @throws java.io.IOException on failure to open/read/write files or output streams
      */
     public static void main(String[] args) throws Exception {
-        String usage = String.format("Usage: java -jar %s.jar [FOLDER]", TomnStoneScanner.class.getSimpleName());
-        
+        String usage = String.format("Usage: java -jar %s.jar [FOLDER]", TombStoneScanner.class.getSimpleName());
+        args = "/home/zhaoyang/program/cassandra-2.1.8-junit/data/data/system/".split(" ");
         if (args.length < 1) {
             System.err.println("You must supply at least one folder");
             System.err.println(usage);
@@ -152,15 +157,31 @@ public class TomnStoneScanner {
     }
 
     public static void process() {
-        Collection<TombstoneMetric> result = collector.stream().collect(
-                Collectors.groupingBy(m -> m.table + m.paritionKey, Collectors.reducing((m1, m2) -> new TombstoneMetric(m1.table, m1.paritionKey, m1.tombstones + m2.tombstones,
-                        m1.total + m2.total)))).values().stream().map(o -> o.get()).collect(Collectors.toList());
-
-        System.out.println("######################################");
-        result.forEach(System.out::println);
+		List<TombstoneMetric> result = collector.stream()
+				.collect(Collectors.groupingBy(m -> m.table + m.paritionKey))
+				.entrySet().stream().map(e -> aggregate(e.getValue()))
+				.collect(Collectors.toList());
+		Collections.sort(result);
+		System.out.println("######################################");
+		result.forEach(System.out::println);
+    }
+    
+    private static TombstoneMetric aggregate(List<TombstoneMetric> list){
+    	if(list==null||list.isEmpty()){
+    		return null;
+    	}
+    	String table = list.get(0).table;
+    	String key = list.get(0).paritionKey;
+    	int tombstones = 0;
+    	int total =0 ;
+    	for(TombstoneMetric metric:list){
+    		tombstones+=metric.tombstones;
+    		total +=metric.total;
+    	} 
+    	return new TombstoneMetric(table, key, tombstones, total);
     }
 
-    public static class TombstoneMetric {
+    public static class TombstoneMetric implements Comparable<TombstoneMetric>{
         public String table;
         public String paritionKey;
         public Integer tombstones;
@@ -174,14 +195,20 @@ public class TomnStoneScanner {
         }
 
         @Override
-        public String toString() {
-            return "TombstoneMetric{" +
-                    "table='" + table + '\'' +
-                    ", paritionKey='" + paritionKey + '\'' +
-                    ", tombstones=" + tombstones +
-                    ", total=" + total +
-                    '}';
-        }
+		public String toString() {
+			return "TombstoneMetric [table=" + table + ", paritionKey="
+					+ paritionKey + ", tombstones=" + tombstones + ", total="
+					+ total + "]";
+		}
+
+		@Override
+		public int compareTo(TombstoneMetric o) { 
+			if(this.tombstones!=o.tombstones){
+				return this.tombstones- o.tombstones;
+			}else{
+				return o.total-this.total ;
+			} 
+		}
     }
 
     public static Map<String, Integer> sortByValue(Map<String, Integer> map) {
