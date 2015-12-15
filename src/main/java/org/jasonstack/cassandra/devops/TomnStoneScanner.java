@@ -16,125 +16,178 @@ package org.jasonstack.cassandra.devops;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.BufferDeletedCell;
+import org.apache.cassandra.db.OnDiskAtom;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.sstable.*;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+import org.apache.cassandra.io.sstable.SSTableReader;
 
-import java.nio.file.*;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Counts the number of tombstones in a column family folder
  */
 public class TomnStoneScanner {
 
-	private static final String partitionerName = "Murmur3Partitioner";
+    private static final String partitionerName = "Murmur3Partitioner";
+    private static List<TombstoneMetric> collector = new ArrayList<>();
 
-	/**
-	 * java -jar TomnStoneScanner.jar [FOLDER]
-	 * <p>
-	 * Counts the number of tombstones, per row, in a given SSTable
-	 * <p>
-	 * Assumes Murmur3Partitioner, standard columns and UTF8 encoded row keys
-	 * <p>
-	 * Does not require a cassandra.yaml file or system tables.
-	 *
-	 * @param args command lines arguments
-	 * @throws java.io.IOException on failure to open/read/write files or output streams
-	 */
-	public static void main(String[] args) throws Exception {
-		String usage = String.format("Usage: java -jar %s.jar [FOLDER]", TomnStoneScanner.class.getSimpleName());
+    /**
+     * java -jar TomnStoneScanner.jar [FOLDER]
+     * <p>
+     * Counts the number of tombstones, per row, in a given SSTable
+     * <p>
+     * Assumes Murmur3Partitioner, standard columns and UTF8 encoded row keys
+     * <p>
+     * Does not require a cassandra.yaml file or system tables.
+     *
+     * @param args command lines arguments
+     * @throws java.io.IOException on failure to open/read/write files or output streams
+     */
+    public static void main(String[] args) throws Exception {
+        String usage = String.format("Usage: java -jar %s.jar [FOLDER]", TomnStoneScanner.class.getSimpleName());
+        
+        if (args.length < 1) {
+            System.err.println("You must supply at least one folder");
+            System.err.println(usage);
+            System.exit(1);
+        }
 
-		if (args.length < 1) {
-			System.err.println("You must supply at least one folder");
-			System.err.println(usage);
-			System.exit(1);
-		}
+        buildConfig();
 
-		buildConfig();
+        try {
+            Files.walk(Paths.get(args[0])).filter(filePath -> isSSTable(filePath)).forEach(sstableFile -> {
+                System.out.println("Scanning SSTable: " + sstableFile);
+                Descriptor descriptor = Descriptor.fromFilename(sstableFile.toString());
+                try {
+                    run(descriptor);
+                } catch (Exception e) {
+                    System.err.println("Unable to scan SSTable " + sstableFile + ", due to " + e.getMessage());
+                }
+            });
+        } finally {
+            process();
 
-		Files.walk(Paths.get(args[0])).filter(filePath -> isSSTable(filePath)).forEach(sstableFile -> {
-			System.out.println("Scanning SSTable: " + sstableFile);
-			Descriptor descriptor = Descriptor.fromFilename(sstableFile.toString());
-			try {
-				run(descriptor);
-			} catch (IOException e) {
-				System.err.println("Unable to scan SSTable " + sstableFile + ", due to " + e.getMessage());
-			}
-		});
+            System.exit(0);
+        }
+    }
 
-		System.exit(0);
-	}
+    /* Hardcoded SSTable format */
+    private static boolean isSSTable(Path filePath) {
+        return filePath.getFileName().toString().endsWith("-Data.db");
+    }
 
-	/* Hardcoded SSTable format */
-	private static boolean isSSTable(Path filePath) {
-		return filePath.getFileName().toString().endsWith("-Data.db");
-	}
+    /* build necessary config to run scanner */
+    private static void buildConfig() throws Exception {
+        // Fake DatabaseDescriptor settings so we don't have to load cassandra.yaml etc
+        Config.setClientMode(true);
 
-	/* build necessary config to run scanner */
-	private static void buildConfig() throws Exception {
-		// Fake DatabaseDescriptor settings so we don't have to load cassandra.yaml etc
-		Config.setClientMode(true);
+        Field configField = DatabaseDescriptor.class.getDeclaredField("conf");
+        configField.setAccessible(true);
+        Config config = (Config) configField.get(null);
+        config.commitlog_sync = Config.CommitLogSync.batch;
+        config.commitlog_sync_batch_window_in_ms = 10.0;
+        config.partitioner = partitionerName;
+        config.file_cache_size_in_mb = 32;
 
-		Field configField = DatabaseDescriptor.class.getDeclaredField("conf");
-		configField.setAccessible(true);
-		Config config = (Config) configField.get(null);
-		config.commitlog_sync = Config.CommitLogSync.batch;
-		config.commitlog_sync_batch_window_in_ms = 10.0;
-		config.partitioner = partitionerName;
-		config.file_cache_size_in_mb = 32;
+        String partitionerClassName = String.format("org.apache.cassandra.dht.%s", partitionerName);
+        try {
+            Class<?> clazz = Class.forName(partitionerClassName);
+            IPartitioner partitioner = (IPartitioner) clazz.newInstance();
+            DatabaseDescriptor.setPartitioner(partitioner);
+        } catch (Exception e) {
+            throw new RuntimeException("Can't instantiate partitioner " + partitionerClassName);
+        }
+    }
 
-		String partitionerClassName = String.format("org.apache.cassandra.dht.%s", partitionerName);
-		try {
-			Class<?> clazz = Class.forName(partitionerClassName);
-			IPartitioner partitioner = (IPartitioner) clazz.newInstance();
-			DatabaseDescriptor.setPartitioner(partitioner);
-		} catch (Exception e) {
-			throw new RuntimeException("Can't instantiate partitioner " + partitionerClassName);
-		}
-	}
+    /* scan tombstones columns and print */
+    private static void run(Descriptor desc) throws IOException {
+        CFMetaData cfm = CFMetaData.sparseCFMetaData(desc.ksname, desc.cfname, UTF8Type.instance);
+        SSTableReader reader = SSTableReader.open(desc, cfm);
+        ISSTableScanner scanner = reader.getScanner();
 
-	/* scan tombstones columns and print */
-	private static void run(Descriptor desc) throws IOException {
-		CFMetaData cfm = CFMetaData.sparseCFMetaData(desc.ksname, desc.cfname, UTF8Type.instance);
-		SSTableReader reader = SSTableReader.open(desc, cfm);
-		ISSTableScanner scanner = reader.getScanner();
+        long totalTombstones = 0, totalColumns = 0;
 
-		long totalTombstones = 0, totalColumns = 0;
+        while (scanner.hasNext()) {
+            // for each partition
+            SSTableIdentityIterator row = (SSTableIdentityIterator) scanner.next();
 
-		while (scanner.hasNext()) {
-			// for each partition
-			SSTableIdentityIterator row = (SSTableIdentityIterator) scanner.next();
+            int tombstonesCount = 0, columnsCount = 0;
+            while (row.hasNext()) {
+                // for each column in partition
+                OnDiskAtom column = row.next();
+                if (column instanceof BufferDeletedCell) {
+                    tombstonesCount++;
+                }
+                columnsCount++;
+            }
+            totalTombstones += tombstonesCount;
+            totalColumns += columnsCount;
 
-			int tombstonesCount = 0, columnsCount = 0;
-			while (row.hasNext()) {
-				// for each column in partition
-				OnDiskAtom column = row.next();
-				if (column instanceof BufferDeletedCell) {
-					tombstonesCount++;
-				}
-				columnsCount++;
-			}
-			totalTombstones += tombstonesCount;
-			totalColumns += columnsCount;
+            if (tombstonesCount > 0) {
+                String key;
+                try {
+                    key = UTF8Type.instance.getString(row.getKey().getKey());
+                } catch (RuntimeException e) {
+                    key = BytesType.instance.getString(row.getKey().getKey());
+                }
+                //System.out.printf("PartitionKey: %s, Tombstones(Total): %d (%d)%n", paritionKey, tombstonesCount, columnsCount);
+                TombstoneMetric count = new TombstoneMetric(desc.cfname, key, tombstonesCount, columnsCount);
+                collector.add(count);
+            }
+        }
+        //System.out.printf("Result: %d tombstones out of total %d columns", totalTombstones, totalColumns);
+        scanner.close();
+    }
 
-			if (tombstonesCount >= 0) {
-				String key;
-				try {
-					key = UTF8Type.instance.getString(row.getKey().getKey());
-				} catch (RuntimeException e) {
-					key = BytesType.instance.getString(row.getKey().getKey());
-				}
-				System.out.printf("PartitionKey: %s, Tombstones(Total): %d (%d)%n", key, tombstonesCount, columnsCount);
-			}
+    public static void process() {
+        Collection<TombstoneMetric> result = collector.stream().collect(
+                Collectors.groupingBy(m -> m.table + m.paritionKey, Collectors.reducing((m1, m2) -> new TombstoneMetric(m1.table, m1.paritionKey, m1.tombstones + m2.tombstones,
+                        m1.total + m2.total)))).values().stream().map(o -> o.get()).collect(Collectors.toList());
 
-		}
-		System.out.printf("Result: %d tombstones out of total %d columns", totalTombstones, totalColumns);
+        System.out.println("######################################");
+        result.forEach(System.out::println);
+    }
 
-		scanner.close();
-	}
+    public static class TombstoneMetric {
+        public String table;
+        public String paritionKey;
+        public Integer tombstones;
+        public Integer total;
 
+        public TombstoneMetric(String table, String key, Integer tombstones, Integer total) {
+            this.table = table;
+            this.paritionKey = key;
+            this.tombstones = tombstones;
+            this.total = total;
+        }
+
+        @Override
+        public String toString() {
+            return "TombstoneMetric{" +
+                    "table='" + table + '\'' +
+                    ", paritionKey='" + paritionKey + '\'' +
+                    ", tombstones=" + tombstones +
+                    ", total=" + total +
+                    '}';
+        }
+    }
+
+    public static Map<String, Integer> sortByValue(Map<String, Integer> map) {
+        Map<String, Integer> result = new LinkedHashMap<>();
+        Stream<Map.Entry<String, Integer>> st = map.entrySet().stream();
+        st.sorted(Comparator.comparing(e -> e.getValue())).forEachOrdered(e -> result.put(e.getKey(), e.getValue()));
+        return result;
+    }
 }
